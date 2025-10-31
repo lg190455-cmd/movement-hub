@@ -1,0 +1,341 @@
+-- LocalScript: MovementHub_Fixed.lua
+-- Coloque em: StarterPlayer -> StarterPlayerScripts
+-- Hub com: Sprint (LeftShift), Super Jump, Infinite Jump
+-- Atalhos: LeftShift = sprint (segure), Space = jump, H = mostrar/ocultar GUI
+-- GUI com botões para ativar/desativar cada habilidade
+--
+-- Observações:
+-- - Este script roda localmente. Para uso competitivo em jogos públicos, implemente validação servidor-side
+--   se for necessário vender/limitar habilidades.
+-- - Ajuste constantes abaixo para balancear.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ====== Configurações ajustáveis ======
+local SPRINT_MULTIPLIER = 1.8    -- multiplicador da velocidade ao sprintar
+local MIN_WALKSPEED = 4
+local MAX_WALKSPEED = 500
+
+local SUPER_JUMP_MULTIPLIER = 1.9 -- multiplica JumpPower para super jump
+local INFINITE_JUMP_STRENGTH = 50 -- força aplicada ao pressionar Space no ar (quando infinite ativado)
+local INFINITE_JUMP_DEBOUNCE = 0.08
+
+-- ====== Estado (iniciando padrão ativado) ======
+local enableSprint = true
+local enableSuperJump = true
+local enableInfiniteJump = false
+
+local sprinting = false
+local guiVisible = true
+
+-- ====== Referências que serão atualizadas no respawn ======
+local character, humanoid, hrp
+local originalWalkSpeed = 16
+local originalJumpPower = nil -- armazenar se existir
+
+-- ====== Funções para gerenciar referências/respawn ======
+local function updateReferences()
+    character = player.Character
+    if character then
+        humanoid = character:FindFirstChildOfClass("Humanoid")
+        hrp = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
+        if humanoid then
+            -- guarda valores originais seguros
+            if not originalWalkSpeed or originalWalkSpeed <= 0 then
+                originalWalkSpeed = (humanoid.WalkSpeed and humanoid.WalkSpeed > 0) and humanoid.WalkSpeed or 16
+            end
+            if originalJumpPower == nil then
+                -- humanoid may use JumpPower or JumpHeight (modern uses JumpPower)
+                originalJumpPower = humanoid.JumpPower or humanoid:GetAttribute("OriginalJumpPower") or humanoid.JumpPower
+            end
+            -- ensure attribute to restore later
+            if humanoid:GetAttribute("OriginalJumpPower") == nil and humanoid.JumpPower then
+                humanoid:SetAttribute("OriginalJumpPower", humanoid.JumpPower)
+            end
+        end
+    else
+        humanoid = nil
+        hrp = nil
+    end
+end
+
+player.CharacterAdded:Connect(function(char)
+    -- delay curto para humanoid existir
+    updateReferences()
+    if not humanoid then
+        humanoid = char:WaitForChild("Humanoid", 5)
+    end
+    hrp = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
+    -- salvar valores originais se necessário
+    if humanoid then
+        originalWalkSpeed = (humanoid.WalkSpeed and humanoid.WalkSpeed > 0) and humanoid.WalkSpeed or originalWalkSpeed
+        if humanoid.JumpPower and humanoid:GetAttribute("OriginalJumpPower") == nil then
+            humanoid:SetAttribute("OriginalJumpPower", humanoid.JumpPower)
+            originalJumpPower = humanoid.JumpPower
+        else
+            originalJumpPower = humanoid:GetAttribute("OriginalJumpPower") or humanoid.JumpPower
+        end
+    end
+
+    -- quando aterrissa, nada especial (infinite jump reabilitado automaticamente localmente)
+end)
+
+-- Se já tiver character ao iniciar
+updateReferences()
+
+-- ====== Sprint (WalkSpeed) ======
+local function getSprintTargetSpeed()
+    if not humanoid then return originalWalkSpeed end
+    local base = originalWalkSpeed or humanoid.WalkSpeed or 16
+    return math.clamp(base * SPRINT_MULTIPLIER, MIN_WALKSPEED, MAX_WALKSPEED)
+end
+
+local function applySprintState()
+    if not humanoid then return end
+    if sprinting and enableSprint then
+        local target = getSprintTargetSpeed()
+        if humanoid.WalkSpeed ~= target then
+            humanoid.WalkSpeed = target
+        end
+    else
+        if humanoid.WalkSpeed ~= originalWalkSpeed then
+            humanoid.WalkSpeed = originalWalkSpeed
+        end
+    end
+end
+
+-- Heartbeat garante aplicação contínua evitando sobrescrita
+RunService.Heartbeat:Connect(function()
+    -- atualiza referências se necessário (caso character tenha mudado)
+    if not humanoid or not character or character ~= player.Character then
+        updateReferences()
+    end
+    -- aplica sprint
+    applySprintState()
+    -- segurança: limita valores extremos
+    if humanoid then
+        if humanoid.WalkSpeed > 2000 or humanoid.WalkSpeed < 0 then
+            humanoid.WalkSpeed = originalWalkSpeed
+        end
+        if humanoid.JumpPower and humanoid.JumpPower > 2000 then
+            humanoid.JumpPower = originalJumpPower or 50
+        end
+    end
+end)
+
+-- ====== Super Jump ======
+local function applySuperJump(enabled)
+    if not humanoid then return end
+    if enabled then
+        if originalJumpPower == nil then
+            originalJumpPower = humanoid.JumpPower or 50
+            humanoid:SetAttribute("OriginalJumpPower", originalJumpPower)
+        end
+        -- aplica multiplicador
+        if humanoid.JumpPower then
+            humanoid.JumpPower = (originalJumpPower or 50) * SUPER_JUMP_MULTIPLIER
+        else
+            -- fallback: tenta setar JumpPower
+            pcall(function() humanoid.JumpPower = (originalJumpPower or 50) * SUPER_JUMP_MULTIPLIER end)
+        end
+    else
+        -- restaura
+        local orig = humanoid:GetAttribute("OriginalJumpPower") or originalJumpPower
+        if orig then
+            pcall(function() humanoid.JumpPower = orig end)
+        end
+    end
+end
+
+-- ====== Infinite Jump ======
+local infiniteJumpDebounce = false
+local function performInfiniteJump()
+    if not humanoid or not hrp then return end
+    if infiniteJumpDebounce then return end
+    infiniteJumpDebounce = true
+
+    -- Se estiver no chão, não forçar (humanoid pula normalmente), se estiver no ar, aplica impulso
+    local state = humanoid:GetState()
+    if state ~= Enum.HumanoidStateType.Landed and state ~= Enum.HumanoidStateType.Running then
+        -- aplicar impulso vertical mantendo velocidade horizontal
+        -- usamos a propriedade Velocity diretamente (mais confiável que BodyVelocity temporário)
+        local vel = hrp.Velocity
+        hrp.Velocity = Vector3.new(vel.X, INFINITE_JUMP_STRENGTH, vel.Z)
+    end
+
+    delay(INFINITE_JUMP_DEBOUNCE, function()
+        infiniteJumpDebounce = false
+    end)
+end
+
+-- ====== Input handling ======
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode.LeftShift then
+            if enableSprint then
+                sprinting = true
+                applySprintState()
+            end
+        elseif input.KeyCode == Enum.KeyCode.Space then
+            -- Se infinite jump está ativo, e pressionou space no ar, aplica
+            if enableInfiniteJump then
+                performInfiniteJump()
+            end
+            -- se não, deixa o humanoid tratar o salto normalmente
+        elseif input.KeyCode == Enum.KeyCode.H then
+            guiVisible = not guiVisible
+            pcall(function() screenGui.Enabled = guiVisible end)
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode.LeftShift then
+            sprinting = false
+            applySprintState()
+        end
+    end
+end)
+
+-- Também suporte para clicar no botão do mouse (caso queira)
+UserInputService.InputChanged:Connect(function(input)
+    -- nada para agora, mas mantido para expansão (scroll para alterar velocidade, etc.)
+end)
+
+-- ====== GUI ======
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "MovementHubGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 320, 0, 172)
+frame.Position = UDim2.new(0, 12, 0, 12)
+frame.BackgroundColor3 = Color3.fromRGB(26,26,26)
+frame.BorderSizePixel = 0
+frame.Parent = screenGui
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -16, 0, 28)
+title.Position = UDim2.new(0, 8, 0, 8)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 18
+title.Text = "Movement Hub"
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = frame
+
+local function makeToggle(nameText, posY, initialState)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 190, 0, 22)
+    lbl.Position = UDim2.new(0, 8, 0, posY)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(220,220,220)
+    lbl.Font = Enum.Font.SourceSans
+    lbl.TextSize = 14
+    lbl.Text = nameText
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 100, 0, 22)
+    btn.Position = UDim2.new(0, 208, 0, posY)
+    btn.BackgroundColor3 = initialState and Color3.fromRGB(0,160,0) or Color3.fromRGB(120,120,120)
+    btn.TextColor3 = Color3.fromRGB(255,255,255)
+    btn.Font = Enum.Font.SourceSans
+    btn.TextSize = 14
+    btn.Text = initialState and "Ativado" or "Desativado"
+    btn.Parent = frame
+
+    return lbl, btn
+end
+
+local sprintLbl, sprintBtn = makeToggle("Sprint (LeftShift)", 44, enableSprint)
+local superJumpLbl, superJumpBtn = makeToggle("Super Jump", 74, enableSuperJump)
+local infJumpLbl, infJumpBtn = makeToggle("Infinite Jump", 104, enableInfiniteJump)
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -16, 0, 28)
+hint.Position = UDim2.new(0, 8, 0, 134)
+hint.BackgroundTransparency = 1
+hint.TextColor3 = Color3.fromRGB(170,170,170)
+hint.Font = Enum.Font.SourceSansItalic
+hint.TextSize = 12
+hint.Text = "Hold LeftShift to sprint. Space to jump. H to hide GUI."
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.Parent = frame
+
+-- Toggle functions
+local function toggleSprint()
+    enableSprint = not enableSprint
+    sprintBtn.BackgroundColor3 = enableSprint and Color3.fromRGB(0,160,0) or Color3.fromRGB(120,120,120)
+    sprintBtn.Text = enableSprint and "Ativado" or "Desativado"
+    if not enableSprint then
+        sprinting = false
+        applySprintState()
+    end
+end
+
+local function toggleSuperJump()
+    enableSuperJump = not enableSuperJump
+    superJumpBtn.BackgroundColor3 = enableSuperJump and Color3.fromRGB(0,160,0) or Color3.fromRGB(120,120,120)
+    superJumpBtn.Text = enableSuperJump and "Ativado" or "Desativado"
+    -- aplica no humanoid atual
+    applySuperJump(enableSuperJump)
+end
+
+local function toggleInfiniteJump()
+    enableInfiniteJump = not enableInfiniteJump
+    infJumpBtn.BackgroundColor3 = enableInfiniteJump and Color3.fromRGB(0,160,0) or Color3.fromRGB(120,120,120)
+    infJumpBtn.Text = enableInfiniteJump and "Ativado" or "Desativado"
+end
+
+sprintBtn.MouseButton1Click:Connect(toggleSprint)
+superJumpBtn.MouseButton1Click:Connect(toggleSuperJump)
+infJumpBtn.MouseButton1Click:Connect(toggleInfiniteJump)
+
+-- Aplica super jump sempre que humanoid for atualizado/respawnar
+-- Mantemos isso numa conexão para reaplicar corretamente
+local function ensureSuperJumpState()
+    if humanoid then
+        applySuperJump(enableSuperJump)
+    end
+end
+
+-- Tenta aplicar quando for criado
+player.CharacterAdded:Connect(function(char)
+    updateReferences()
+    -- aguarda humanoid pronto e aplica super jump se necessário
+    if humanoid then
+        ensureSuperJumpState()
+    end
+end)
+
+-- Inicialização visual
+screenGui.Enabled = guiVisible
+-- aplica estado atual (se já houver humanoid)
+ensureSuperJumpState()
+
+-- Cleanup ao fechar/saír
+player.AncestryChanged:Connect(function()
+    if not player:IsDescendantOf(game) then
+        if humanoid then
+            pcall(function()
+                humanoid.WalkSpeed = originalWalkSpeed
+                if humanoid:GetAttribute("OriginalJumpPower") then
+                    humanoid.JumpPower = humanoid:GetAttribute("OriginalJumpPower")
+                end
+            end)
+        end
+    end
+end)
